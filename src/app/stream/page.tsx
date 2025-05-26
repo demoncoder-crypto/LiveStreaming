@@ -64,16 +64,27 @@ export default function StreamPage() {
   // 2. useRef for DOM elements
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideosRef = useRef<HTMLDivElement>(null);
+  const recvTransportPromiseRef = useRef<Promise<mediasoupClient.types.Transport | null> | null>(null);
 
   // 3. useCallback for helper functions (order can matter if they depend on each other)
   const addRemoteVideo = useCallback((stream: MediaStream, consumerId: string) => {
     if (!remoteVideosRef.current) return;
     const existingVideo = document.getElementById(`remote-video-${consumerId}`);
     if (existingVideo) return;
+
+    console.log(`Adding remote video for consumer ${consumerId}. Stream:`, stream);
+    if (stream) {
+        console.log('Stream tracks:', stream.getTracks());
+        stream.getTracks().forEach(track => {
+            console.log(`Track ID: ${track.id}, Kind: ${track.kind}, ReadyState: ${track.readyState}, Enabled: ${track.enabled}, Muted: ${track.muted}`);
+        });
+    }
+
     const video = document.createElement('video');
     video.id = `remote-video-${consumerId}`;
     video.srcObject = stream;
     video.autoplay = true; video.playsInline = true;
+    video.muted = true;
     video.style.width = '320px'; video.style.border = '1px solid green'; video.style.margin = '5px';
     remoteVideosRef.current.appendChild(video);
   }, []);
@@ -244,27 +255,34 @@ export default function StreamPage() {
   }, [isCreatingSendTransport, isProducingVideo, isProducingAudio]); // Add new flags to dependencies
 
   const ensureRecvTransport = useCallback(async (device: mediasoupClient.Device, currentConsumingSocket: Socket) => {
-    if (recvTransport && !recvTransport.closed) return recvTransport;
-    if (isCreatingRecvTransport) {
-      console.warn('ensureRecvTransport: Receive transport creation already in progress.');
-      // For now, just prevent re-entry. A more robust solution might queue or wait.
-      return Promise.reject(new Error('Receive transport creation in progress')); 
+    if (recvTransportRef.current && !recvTransportRef.current.closed) {
+      console.log('ensureRecvTransport: Using existing open transport.');
+      return recvTransportRef.current;
     }
+
+    if (recvTransportPromiseRef.current) {
+      console.warn('ensureRecvTransport: Receive transport creation already in progress, returning existing promise.');
+      return recvTransportPromiseRef.current;
+    }
+
+    console.log('ensureRecvTransport: Creating new receive transport...');
     setIsCreatingRecvTransport(true);
 
-    console.log('Creating receive transport...');
-    return new Promise<mediasoupClient.types.Transport | null>((resolve, reject) => {
+    const promise = new Promise<mediasoupClient.types.Transport | null>((resolve, reject) => {
         currentConsumingSocket.emit('createWebRtcTransport', { producing: false, consuming: true }, (params: ServerCallbackResponse) => {
             if (params.error || !params.id) {
                 console.error('Error creating recv transport:', params.error);
                 setRecvTransport(null);
-                setIsCreatingRecvTransport(false); // Reset flag on error
+                recvTransportRef.current = null;
+                setIsCreatingRecvTransport(false);
+                recvTransportPromiseRef.current = null;
                 reject(new Error(params.error || 'Failed to create recv transport'));
                 return;
             }
             const transport = device.createRecvTransport(params as mediasoupClient.types.TransportOptions);
             setRecvTransport(transport);
-            setIsCreatingRecvTransport(false); // Reset flag on success
+            recvTransportRef.current = transport;
+            setIsCreatingRecvTransport(false);
 
             transport.on('connect', ({ dtlsParameters }, callback, errback) => {
                 console.log('Recv transport connecting...');
@@ -282,29 +300,49 @@ export default function StreamPage() {
                 console.log(`Recv transport connection state: ${state}`);
                 if (state === 'failed' || state === 'closed' || state ==='disconnected') {
                     console.warn('Recv transport failed/closed, cleaning up consumers for this transport');
-                    transport.close();
-                    setRecvTransport(null);
-                    // Clean up consumers associated with this transport
-                    setRemoteStreams(prev => {
-                        const newMap = new Map(prev);
-                        prev.forEach(rs => {
+                    if (!transport.closed) transport.close();
+                    setRecvTransport(prev => (prev?.id === transport.id ? null : prev));
+                    
+                    setRemoteStreams(prevRemoteStreams => {
+                        const newMap = new Map(prevRemoteStreams);
+                        let changed = false;
+                        prevRemoteStreams.forEach(rs => {
                             const consumerAppData = rs.consumer.appData as ExtendedAppData;
                             if (consumerAppData?.transportId === transport.id) {
                                 if(!rs.consumer.closed) rs.consumer.close();
                                 removeRemoteVideo(rs.id);
                                 newMap.delete(rs.id);
+                                changed = true;
                             }
                         });
-                        setIsCreatingRecvTransport(false); // Also reset if transport closes/fails later
-                        return newMap;
+                        return changed ? newMap : prevRemoteStreams;
                     });
+                    setIsCreatingRecvTransport(false); 
+                    if (recvTransportPromiseRef.current === promise) {
+                        recvTransportPromiseRef.current = null;
+                    }
+                } else if (state === 'connected') {
+                    if (recvTransportPromiseRef.current === promise) {
+                        
+                    }
                 }
             });
             console.log('Receive transport created:', transport.id);
             resolve(transport);
         });
     });
-  }, [recvTransport, removeRemoteVideo, isCreatingRecvTransport]); // Added isCreatingRecvTransport
+    recvTransportPromiseRef.current = promise;
+
+    promise.finally(() => {
+        if (recvTransportPromiseRef.current === promise) {
+            recvTransportPromiseRef.current = null;
+        }
+        setIsCreatingRecvTransport(false);
+    });
+
+    return promise;
+
+  }, [removeRemoteVideo]);
 
   const consumeRemoteProducer = useCallback(async (device: mediasoupClient.Device, currentSocket: Socket, producerToConsumeId: string, producerAppData?: mediasoupClient.types.AppData) => {
     if (!device.rtpCapabilities) {
@@ -353,22 +391,16 @@ export default function StreamPage() {
             }));
             addRemoteVideo(newStream, consumer.id);
 
-            // Important: resume the consumer on the server if it was created paused (server default is unpaused for this example)
-            // If server creates consumer paused, client would need to emit 'resume-consumer' here.
-            // socket.emit('resume-consumer', { consumerId: consumer.id }, (res: {error?: string}) => { ... });
-
             consumer.on('trackended', () => {
                 console.log(`Remote track ended for consumer ${consumer.id}`);
                 setRemoteStreams(prev => { const newMap = new Map(prev); newMap.delete(consumer.id); return newMap; });
                 removeRemoteVideo(consumer.id);
-                // Consumer might be auto-closed by mediasoup-client, or you might close it manually
             });
             consumer.on('transportclose', () => {
                 console.log(`Transport closed for consumer ${consumer.id}`);
                 setRemoteStreams(prev => { const newMap = new Map(prev); newMap.delete(consumer.id); return newMap; });
                 removeRemoteVideo(consumer.id);
             });
-            // 'producerclose' event on consumer is handled by server sending 'consumer-closed' or 'producer-closed'
 
         } catch (consumeError) {
             console.error('Error creating new consumer object:', consumeError);
