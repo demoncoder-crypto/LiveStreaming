@@ -9,6 +9,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
+import { spawn } from 'child_process';
 
 // Fix for __dirname in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -39,7 +40,7 @@ const app = express();
 // Enable CORS for all routes
 app.use(cors());
 
-const hlsOutputFolder = path.join(__dirname, '../../public/hls');
+const hlsOutputFolder = path.join(__dirname, '../public/hls');
 console.log('HLS Output Folder Path:', hlsOutputFolder);
 if (!fs.existsSync(hlsOutputFolder)) {
   fs.mkdirSync(hlsOutputFolder, { recursive: true });
@@ -54,9 +55,16 @@ app.get('/api/clear-hls-cache', (req, res) => {
     
     // Stop current FFMPEG process
     if (hlsComposition.ffmpegProcess) {
-      hlsComposition.ffmpegProcess.kill('SIGTERM');
-      hlsComposition.ffmpegProcess = null;
+      try {
+        hlsComposition.ffmpegProcess.kill('SIGTERM');
+        hlsComposition.ffmpegProcess = null;
+      } catch (error) {
+        console.error('Error stopping FFMPEG process:', error);
+      }
     }
+    
+    // Reset port allocation
+    nextPortPair = 0;
     
     // Clear all HLS files
     if (fs.existsSync(hlsOutputFolder)) {
@@ -76,13 +84,14 @@ app.get('/api/clear-hls-cache', (req, res) => {
     // Reset composition state
     hlsComposition.isComposing = false;
     
-    // Restart composition if there are active streams
-    if (hlsComposition.activeStreams.size > 0) {
-      console.log('Restarting HLS composition after cache clear...');
-      setTimeout(() => {
+    // Wait a bit for ports to be released
+    setTimeout(() => {
+      // Restart composition if there are active streams
+      if (hlsComposition.activeStreams.size > 0) {
+        console.log('Restarting HLS composition after cache clear...');
         restartHlsComposition().catch(err => console.error('Error restarting HLS after cache clear:', err));
-      }, 1000);
-    }
+      }
+    }, 2000); // Wait 2 seconds for ports to be released
     
     res.json({ success: true, message: 'HLS cache cleared', activeStreams: hlsComposition.activeStreams.size });
   } catch (error: any) {
@@ -141,6 +150,34 @@ app.get('/api/debug-path', (req, res) => {
   }
 });
 
+// Add debug endpoint to check active streams and codecs
+app.get('/api/debug-streams', (req, res) => {
+  try {
+    const streamInfo = {
+      activeStreams: hlsComposition.activeStreams.size,
+      ffmpegRunning: !!hlsComposition.ffmpegProcess,
+      streams: Array.from(hlsComposition.activeStreams.entries()).map(([id, info]) => ({
+        producerId: id,
+        hasVideo: !!info.videoConsumer,
+        hasAudio: !!info.audioConsumer,
+        videoCodec: info.videoConsumer?.rtpParameters?.codecs?.[0]?.mimeType || 'none',
+        audioCodec: info.audioConsumer?.rtpParameters?.codecs?.[0]?.mimeType || 'none',
+        videoPaused: info.videoConsumer?.paused || false,
+        audioPaused: info.audioConsumer?.paused || false
+      })),
+      allProducers: Array.from(allProducers.entries()).map(([id, data]) => ({
+        id,
+        kind: data.kind,
+        socketId: data.socketId,
+        codec: data.producer.rtpParameters?.codecs?.[0]?.mimeType || 'unknown'
+      }))
+    };
+    res.json(streamInfo);
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Direct HLS playlist endpoint as fallback
 app.get('/hls/playlist.m3u8', (req, res) => {
   try {
@@ -187,6 +224,50 @@ app.get('/hls/:filename', (req, res) => {
       res.status(404).send('File not found');
     }
   } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Add endpoint to manually restart HLS composition
+app.get('/api/restart-hls', async (req, res) => {
+  try {
+    console.log('Manually restarting HLS composition...');
+    
+    // Stop any existing FFmpeg
+    if (hlsComposition.ffmpegProcess) {
+      try {
+        hlsComposition.ffmpegProcess.kill('SIGTERM');
+        hlsComposition.ffmpegProcess = null;
+      } catch (error) {
+        console.error('Error stopping existing FFmpeg:', error);
+      }
+    }
+    
+    // Reset state
+    hlsComposition.isComposing = false;
+    nextPortPair = 0;
+    
+    // Wait for ports to be released
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Restart if we have streams
+    if (hlsComposition.activeStreams.size > 0) {
+      await restartHlsComposition();
+      res.json({ 
+        success: true, 
+        message: 'HLS composition restarted', 
+        activeStreams: hlsComposition.activeStreams.size,
+        ffmpegRunning: !!hlsComposition.ffmpegProcess 
+      });
+    } else {
+      res.json({ 
+        success: false, 
+        message: 'No active streams to restart', 
+        activeStreams: 0 
+      });
+    }
+  } catch (error: any) {
+    console.error('Error restarting HLS:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -242,10 +323,18 @@ const BASE_RTP_PORT = 5000;
 let nextPortPair = 0; // Will be multiplied by 2 and added to base
 
 function getNextRtpPortPair(): { video: number; audio: number } {
-  const videoPorts = BASE_RTP_PORT + (nextPortPair * 2);
-  const audioPorts = BASE_RTP_PORT + (nextPortPair * 2) + 1;
+  // Use a wider port range to avoid conflicts
+  const portOffset = nextPortPair * 4; // Use 4 ports spacing instead of 2
+  const videoPort = BASE_RTP_PORT + portOffset;
+  const audioPort = BASE_RTP_PORT + portOffset + 2;
   nextPortPair++;
-  return { video: videoPorts, audio: audioPorts };
+  
+  // Reset if we go too high
+  if (nextPortPair > 100) {
+    nextPortPair = 0;
+  }
+  
+  return { video: videoPort, audio: audioPort };
 }
 
 const getNumWorkers = () => {
@@ -284,6 +373,17 @@ async function startMediasoup() {
     },
     {
       kind: 'video',
+      mimeType: 'video/H264',
+      clockRate: 90000,
+      parameters: {
+        'packetization-mode': 1,
+        'profile-level-id': '42e01f', // Baseline profile, level 3.1
+        'level-asymmetry-allowed': 1,
+        'x-google-start-bitrate': 1000,
+      },
+    },
+    {
+      kind: 'video',
       mimeType: 'video/VP8',
       clockRate: 90000,
       parameters: {
@@ -293,7 +393,7 @@ async function startMediasoup() {
   ];
 
   router = await worker.createRouter({ mediaCodecs });
-  console.log('Mediasoup router created.');
+  console.log('Mediasoup router created with H.264 priority.');
 
   await setupHlsPlainTransport();
 }
@@ -348,7 +448,7 @@ async function setupHlsPlainTransport() {
       listenIp: '127.0.0.1',
       enableSctp: false,
       rtcpMux: false,
-      comedia: true  // Let FFMPEG initiate the connection
+      comedia: false  // We'll specify the destination
     });
 
     hlsStreamSource.isVideoPortConnected = false;
@@ -434,7 +534,7 @@ t=0 0
     console.log('HLS: Setting up FFMPEG command...');
     try {
         ffmpegProcess = ffmpeg()
-            .input(sdpFilePath)
+            .input(sdpFilePath.replace(/\\/g, '/'))
             .inputOptions([
                 '-protocol_whitelist', 'file,udp,rtp',
                 '-re',
@@ -443,8 +543,7 @@ t=0 0
                 '-avoid_negative_ts', 'make_zero',
                 '-max_delay', '5000000',
                 '-reorder_queue_size', '0',
-                '-analyzeduration', '1000000',
-                '-probesize', '1000000'
+                '-analyzeduration', '1000000'
             ])
             .videoCodec('libx264')
             .audioCodec('aac')
@@ -462,7 +561,8 @@ t=0 0
                 '-bufsize', '2000k',
                 '-r', '30',
                 '-f', 'null',
-                '-'
+                '-b:a', '128k',
+                '-ar', '44100'
             ])
             .output('pipe:')
             .on('start', (commandLine) => {
@@ -472,8 +572,6 @@ t=0 0
                 setTimeout(() => {
                   startHlsEncoding();
                 }, 1000);
-                
-                resolve();
             })
             .on('stderr', (stderrLine) => {
                 console.log(`FFMPEG stderr: ${stderrLine}`);
@@ -482,7 +580,6 @@ t=0 0
                 console.error('FFMPEG error:', err);
                 isFfmpegLaunching = false;
                 ffmpegProcess = null;
-                reject(err);
             })
             .on('end', () => {
                 console.log('FFMPEG process ended');
@@ -511,7 +608,7 @@ function startHlsEncoding() {
   console.log('HLS: Starting HLS encoding process...');
   
   const hlsProcess = ffmpeg()
-    .input(sdpFilePath)
+    .input(sdpFilePath.replace(/\\/g, '/'))
     .inputOptions([
       '-protocol_whitelist', 'file,udp,rtp',
       '-re',
@@ -519,8 +616,8 @@ function startHlsEncoding() {
       '-fflags', '+genpts+igndts+discardcorrupt',
       '-avoid_negative_ts', 'make_zero',
       '-max_delay', '5000000',
-      '-analyzeduration', '1000000',
-      '-probesize', '1000000'
+      '-reorder_queue_size', '0',
+      '-analyzeduration', '1000000'
     ])
     .videoCodec('libx264')
     .audioCodec('aac')
@@ -537,34 +634,31 @@ function startHlsEncoding() {
       '-maxrate', '1200k',
       '-bufsize', '2000k',
       '-r', '30',
-      '-hls_time', '6',
-      '-hls_list_size', '10',
-      '-hls_flags', 'delete_segments+independent_segments+split_by_time',
-      '-hls_segment_type', 'mpegts',
-      '-hls_segment_filename', path.join(HLS_OUTPUT_DIR, 'segment_%03d.ts'),
-      '-start_number', '0',
-      '-f', 'hls',
-      '-y'
+      '-f', 'null',
+      '-b:a', '128k',
+      '-ar', '44100'
     ])
-    .output(path.join(HLS_OUTPUT_DIR, 'playlist.m3u8'))
+    .output('pipe:')
     .on('start', (commandLine) => {
-      console.log('HLS encoding started with command:', commandLine);
+      console.log('FFMPEG process started with command:', commandLine);
+      
+      // Start the actual HLS encoding process
+      setTimeout(() => {
+        startHlsEncoding();
+      }, 1000);
     })
     .on('stderr', (stderrLine) => {
-      console.log(`HLS FFMPEG stderr: ${stderrLine}`);
+      console.log(`FFMPEG stderr: ${stderrLine}`);
     })
     .on('error', (err) => {
-      console.error('HLS FFMPEG error:', err);
-      // Try to restart after a delay
-      setTimeout(() => {
-        if (hlsStreamSource.videoRtpConsumer && !hlsStreamSource.videoRtpConsumer.closed) {
-          console.log('Attempting to restart HLS encoding...');
-          startHlsEncoding();
-        }
-      }, 5000);
+      console.error('FFMPEG error:', err);
+      isFfmpegLaunching = false;
+      ffmpegProcess = null;
     })
     .on('end', () => {
-      console.log('HLS FFMPEG process ended');
+      console.log('FFMPEG process ended');
+      isFfmpegLaunching = false;
+      ffmpegProcess = null;
     });
 
   hlsProcess.run();
@@ -662,74 +756,40 @@ async function startFfmpegStream(producerToStream: mediasoupTypes.Producer, kind
     }
 
     console.log(`HLS: Consuming video producer ${producerId} on PlainTransport ${hlsStreamSource.plainTransport.id}`);
-    hlsStreamSource.videoRtpConsumer = await hlsStreamSource.plainTransport.consume({
-      producerId: hlsStreamSource.videoProducerId,
-      rtpCapabilities: router.rtpCapabilities,
-      paused: true,
-      appData: { mediaType: 'video', source: 'hls', forProducerId: producerId }
+    const rtpPorts = getNextRtpPortPair();
+
+    // Tell the transport where to send RTP/RTCP
+    await hlsStreamSource.plainTransport.connect({
+      ip: '127.0.0.1',
+      port: rtpPorts.video,
+      rtcpPort: rtpPorts.video + 1000
     });
-    console.log('HLS: Video RTP Consumer created for HLS (initially paused).');
-    if (hlsStreamSource.videoRtpConsumer) {
-      console.log(`HLS Consumer Details: ID: ${hlsStreamSource.videoRtpConsumer.id}, Kind: ${hlsStreamSource.videoRtpConsumer.kind}, Type: ${hlsStreamSource.videoRtpConsumer.type}, Paused: ${hlsStreamSource.videoRtpConsumer.paused}, ProducerPaused: ${hlsStreamSource.videoRtpConsumer.producerPaused}`);
 
-      hlsStreamSource.videoRtpConsumer.on('producerclose', async () => {
-        console.log(`HLS: Producer ${hlsStreamSource.videoProducerId} associated with HLS consumer ${hlsStreamSource.videoRtpConsumer?.id} has closed.`);
-        await stopFfmpegStream();
-      });
+    const videoConsumer = await hlsStreamSource.plainTransport.consume({
+      producerId: producerId,
+      rtpCapabilities: router.rtpCapabilities,
+      paused: true,  // Start paused, resume after FFMPEG connects
+      appData: { streamId: 'hls', type: 'hls-composition' }
+    });
 
-      hlsStreamSource.videoRtpConsumer.on('transportclose', async () => {
-        console.log(`HLS: PlainTransport for HLS consumer ${hlsStreamSource.videoRtpConsumer?.id} has closed.`);
-        await stopFfmpegStream();
-        setupHlsPlainTransport().catch(err => console.error("HLS: Error auto-re-setting up plain transport after closure:", err));
-      });
-    } else {
-        console.error("HLS: Failed to create videoRtpConsumer. Aborting.");
-        hlsStreamSource.videoProducerId = undefined;
-        return;
-    }
+    hlsStreamSource.videoRtpConsumer = videoConsumer;
 
-    await launchFfmpegForHls();
-    console.log("HLS: FFMPEG launch promise resolved for new producer. Proceeding to connect transport, request keyframe, and resume consumer.");
+    console.log(`Stream ${producerId} added to composition with video port: ${rtpPorts.video}, RTCP port: ${rtpPorts.video + 1000}`);
+    
+    // Log transport and consumer details
+    console.log(`PlainTransport tuple:`, hlsStreamSource.plainTransport.tuple);
+    console.log(`Consumer RTP parameters:`, JSON.stringify(videoConsumer.rtpParameters, null, 2));
+    
+    // Don't resume immediately - wait for FFmpeg to start
+    console.log(`Consumer created in paused state for producer ${producerId}`);
+    
+    await restartHlsComposition();
 
-    console.log("HLS: Introducing a short delay (500ms) before connecting transport and resuming consumer for new producer flow...");
-    await new Promise(resolve => setTimeout(resolve, 500));
-    console.log("HLS: Delay finished for new producer flow.");
-
-    if (!hlsStreamSource.isVideoPortConnected && hlsStreamSource.plainTransport && hlsStreamSource.plainTransport.tuple) {
-      console.log(`HLS: Connecting PlainTransport to send to FFMPEG. FFMPEG Listen Port: ${FFMPEG_RTP_VIDEO_PORT}. PlainTransport Tuple: ${JSON.stringify(hlsStreamSource.plainTransport.tuple)}`);
-      await hlsStreamSource.plainTransport.connect({
-        ip: '127.0.0.1',
-        port: FFMPEG_RTP_VIDEO_PORT
-      });
-      hlsStreamSource.isVideoPortConnected = true;
-      console.log('HLS: PlainTransport connected for sending video to FFMPEG.');
-    } else if (hlsStreamSource.isVideoPortConnected) {
-      console.log("HLS: PlainTransport for video already connected to FFMPEG (should not happen for a new producer flow ideally, but handling).");
-    } else {
-      console.error("HLS Error: PlainTransport tuple not available after FFMPEG launch, cannot connect for FFMPEG.");
-      await stopFfmpegStream();
-      return;
-    }
-
-    if (hlsStreamSource.videoRtpConsumer && !hlsStreamSource.videoRtpConsumer.closed) {
-        console.log(`HLS: Requesting key frame via HLS consumer ${hlsStreamSource.videoRtpConsumer.id} for producer ${producerId}`);
-        await hlsStreamSource.videoRtpConsumer.requestKeyFrame();
-        console.log(`HLS: Key frame requested successfully via HLS consumer for producer ${producerId}.`);
-        
-        if (hlsStreamSource.videoRtpConsumer.paused) {
-            console.log(`HLS: Resuming HLS consumer ${hlsStreamSource.videoRtpConsumer.id}`);
-            await hlsStreamSource.videoRtpConsumer.resume();
-            console.log(`HLS: HLS consumer ${hlsStreamSource.videoRtpConsumer.id} resumed.`);
-        }
-    } else {
-        console.warn("HLS: Could not request keyframe or resume - HLS consumer not available or closed after FFMPEG launch.");
-        await stopFfmpegStream();
-    }
-
-  } catch (error: any) {
-    console.error(`HLS: Error in startFfmpegStream for new producer ${producerId}: ${error.message}`);
-    console.error("HLS Error details:", error);
-    await stopFfmpegStream();
+  } catch (error) {
+    console.error(`Error adding stream ${producerId} to HLS composition:`, error);
+    // If adding stream fails, show live stream status
+    console.log('Stream addition failed, creating live stream status video...');
+    createStaticInformationalStream();
   }
 }
 
@@ -967,7 +1027,14 @@ async function addStreamToHlsComposition(producer: mediasoupTypes.Producer, sock
       listenIp: '127.0.0.1',
       enableSctp: false,
       rtcpMux: false,
-      comedia: true  // Let FFMPEG initiate the connection
+      comedia: false  // We'll specify the destination
+    });
+
+    // Tell the transport where to send RTP/RTCP
+    await plainTransport.connect({
+      ip: '127.0.0.1',
+      port: rtpPorts.video,
+      rtcpPort: rtpPorts.video + 1000
     });
 
     const videoConsumer = await plainTransport.consume({
@@ -977,36 +1044,21 @@ async function addStreamToHlsComposition(producer: mediasoupTypes.Producer, sock
       appData: { streamId: socketId, type: 'hls-composition' }
     });
 
-    // Connect transport after consumer is created
-    await plainTransport.connect({
-      ip: '127.0.0.1',
-      port: rtpPorts.video,
-      rtcpPort: rtpPorts.video + 1000
-    });
-
     hlsComposition.activeStreams.set(producer.id, {
       producerId: producer.id,
-      plainTransport,
-      videoConsumer,
-      rtpPorts
+      plainTransport: plainTransport,
+      videoConsumer: videoConsumer,
+      rtpPorts: rtpPorts
     });
 
     console.log(`Stream ${producer.id} added to composition with video port: ${rtpPorts.video}, RTCP port: ${rtpPorts.video + 1000}`);
     
-    // Resume consumer after a delay to ensure FFMPEG is ready
-    setTimeout(async () => {
-      if (videoConsumer && !videoConsumer.closed && videoConsumer.paused) {
-        await videoConsumer.resume();
-        console.log(`Consumer resumed for producer ${producer.id}`);
-        // Request keyframe after resuming
-        setTimeout(async () => {
-          if (videoConsumer && !videoConsumer.closed) {
-            await videoConsumer.requestKeyFrame();
-            console.log(`Keyframe requested for producer ${producer.id}`);
-          }
-        }, 1000);
-      }
-    }, 2000);
+    // Log transport and consumer details
+    console.log(`PlainTransport tuple:`, plainTransport.tuple);
+    console.log(`Consumer RTP parameters:`, JSON.stringify(videoConsumer.rtpParameters, null, 2));
+    
+    // Don't resume immediately - wait for FFmpeg to start
+    console.log(`Consumer created in paused state for producer ${producer.id}`);
     
     await restartHlsComposition();
 
@@ -1044,25 +1096,31 @@ async function removeStreamFromHlsComposition(producerId: string) {
 }
 
 async function restartHlsComposition() {
-  // Stop existing FFMPEG process
-  if (hlsComposition.ffmpegProcess) {
-    try {
-      hlsComposition.ffmpegProcess.kill('SIGTERM');
-      hlsComposition.ffmpegProcess = null;
-    } catch (error) {
-      console.error('Error stopping FFMPEG composition:', error);
-    }
-    // Wait a bit for the process to fully terminate
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-
   const activeStreamCount = hlsComposition.activeStreams.size;
   
   if (activeStreamCount === 0) {
+    // Stop existing FFMPEG process only when no streams
+    if (hlsComposition.ffmpegProcess) {
+      try {
+        hlsComposition.ffmpegProcess.kill('SIGTERM');
+        hlsComposition.ffmpegProcess = null;
+      } catch (error) {
+        console.error('Error stopping FFMPEG composition:', error);
+      }
+      // Wait a bit for the process to fully terminate
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
     console.log('No active streams for HLS composition - creating status video');
     hlsComposition.isComposing = false;
     // Always create status video when no streams are active
     createStaticInformationalStream();
+    return;
+  }
+
+  // If FFmpeg is already running and we have streams, don't restart it
+  if (hlsComposition.ffmpegProcess && activeStreamCount > 0) {
+    console.log(`FFmpeg already running with ${activeStreamCount} stream(s), not restarting`);
     return;
   }
 
@@ -1082,155 +1140,66 @@ async function restartHlsComposition() {
       console.log('Created HLS output directory:', hlsOutputFolder);
     }
 
-    // Clean up old files
-    const oldFiles = ['playlist.m3u8', 'playlist.m3u8.tmp'];
-    oldFiles.forEach(file => {
-      const filePath = path.join(hlsOutputFolder, file);
-      if (fs.existsSync(filePath)) {
+    // Only clean up files if we're starting fresh
+    if (!hlsComposition.ffmpegProcess) {
+      // Clean up old files but keep demo-segment.ts for fallback
+      const oldFiles = fs.readdirSync(hlsOutputFolder).filter(file => 
+        (file.endsWith('.ts') && file !== 'demo-segment.ts') || 
+        file === 'playlist.m3u8' || 
+        file.endsWith('.sdp')
+      );
+      
+      for (const file of oldFiles) {
+        const filePath = path.join(hlsOutputFolder, file);
         try {
+          // On Windows, we need to ensure file is not locked
+          if (file === 'playlist.m3u8') {
+            // Create a temporary playlist first
+            const tempPath = path.join(hlsOutputFolder, 'playlist.tmp.m3u8');
+            if (fs.existsSync(tempPath)) {
+              fs.unlinkSync(tempPath);
+            }
+          }
           fs.unlinkSync(filePath);
           console.log('Cleaned up old file:', file);
         } catch (err) {
           console.warn('Could not remove old file:', file, err);
         }
       }
-    });
+    }
     
-    const streamArray = Array.from(hlsComposition.activeStreams.values());
-    const sdpFiles: string[] = [];
-    
-    for (const [index, streamInfo] of streamArray.entries()) {
-      const sdpFilePath = path.join(hlsOutputFolder, `stream_${index}.sdp`);
+    // Create HLS output based on number of streams
+    if (activeStreamCount >= 1 && !hlsComposition.ffmpegProcess) {
+      const streams = Array.from(hlsComposition.activeStreams.entries());
       
-      if (streamInfo.videoConsumer) {
-        const videoRtpParameters = streamInfo.videoConsumer.rtpParameters;
-        const videoCodec = videoRtpParameters.codecs[0];
+      if (activeStreamCount === 1) {
+        // Single stream - direct output
+        const [streamId, streamInfo] = streams[0];
+        console.log(`Creating HLS output for single stream ${streamId}`);
+        await createSingleStreamHls(streamId, streamInfo);
+      } else {
+        // Multiple streams - for now just show the first one
+        console.log(`Multiple streams (${activeStreamCount}) detected, showing first stream only`);
+        const [streamId, streamInfo] = streams[0];
+        console.log(`Creating HLS output for first stream ${streamId}`);
+        await createSingleStreamHls(streamId, streamInfo);
         
-        // Enhanced SDP with explicit video dimensions and better codec parameters
-        const sdpContent = `v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=Stream ${index}
-c=IN IP4 127.0.0.1
-t=0 0
-m=video ${streamInfo.rtpPorts.video} RTP/AVP ${videoCodec.payloadType}
-a=rtpmap:${videoCodec.payloadType} ${videoCodec.mimeType.split('/')[1]}/${videoCodec.clockRate}
-a=recvonly
-a=rtcp:${streamInfo.rtpPorts.video + 1000}
-a=framerate:30
-a=fmtp:${videoCodec.payloadType} max-fr=30;max-fs=8160;picture-id=15
-a=imageattr:${videoCodec.payloadType} send [x=1280,y=720] recv [x=1280,y=720]
-`;
-        
-        fs.writeFileSync(sdpFilePath, sdpContent.trim());
-        sdpFiles.push(sdpFilePath);
-        console.log(`Created enhanced SDP file for stream ${index}:`, sdpFilePath);
+        // TODO: Re-enable mosaic once FFmpeg filter issues are resolved
+        /*
+        // Try mosaic first, but have a fallback
+        try {
+          await createMosaicHls(streams);
+        } catch (error) {
+          console.error('Mosaic failed, falling back to first stream:', error);
+          // Fall back to showing just the first stream
+          const [streamId, streamInfo] = streams[0];
+          console.log(`Falling back to single stream ${streamId}`);
+          await createSingleStreamHls(streamId, streamInfo);
+        }
+        */
       }
     }
-
-    if (sdpFiles.length === 0) {
-      console.error('No valid SDP files created for HLS composition');
-      hlsComposition.isComposing = false;
-      console.log('Creating status video due to no valid SDP files...');
-      createStaticInformationalStream();
-      return;
-    }
-
-    hlsComposition.ffmpegProcess = ffmpeg();
     
-    // Add all inputs with enhanced options for VP8 handling
-    sdpFiles.forEach((sdpFile) => {
-      hlsComposition.ffmpegProcess = hlsComposition.ffmpegProcess
-        .input(sdpFile)
-        .inputOptions([
-          '-protocol_whitelist', 'file,udp,rtp',
-          '-fflags', '+genpts+igndts+discardcorrupt',
-          '-avoid_negative_ts', 'make_zero',
-          '-thread_queue_size', '1024',
-          '-rtbufsize', '100M',
-          '-max_delay', '1000000',
-          '-reorder_queue_size', '1000',
-          '-probesize', '50M',
-          '-analyzeduration', '10000000'
-        ]);
-    });
-
-    // Build video filter for composition with explicit sizing
-    let videoFilter = '';
-    if (activeStreamCount === 1) {
-      videoFilter = '[0:v]scale=1280:720:force_original_aspect_ratio=decrease:eval=frame,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[out]';
-    } else if (activeStreamCount === 2) {
-      videoFilter = '[0:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v0];[1:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v1];[v0][v1]hstack=inputs=2[out]';
-    } else if (activeStreamCount === 3) {
-      videoFilter = '[0:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v0];[1:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v1];[2:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v2];[v0][v1]hstack=inputs=2[top];[v2]pad=1280:360:320:0:color=black[bottom];[top][bottom]vstack=inputs=2[out]';
-    } else {
-      // 2x2 grid for 4+ streams
-      videoFilter = '[0:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v0];[1:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v1];[2:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v2];[3:v]scale=640:360:force_original_aspect_ratio=decrease:eval=frame,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=25,format=yuv420p[v3];[v0][v1]hstack=inputs=2[top];[v2][v3]hstack=inputs=2[bottom];[top][bottom]vstack=inputs=2[out]';
-    }
-
-    const outputPath = path.join(hlsOutputFolder, 'playlist.m3u8');
-    
-    hlsComposition.ffmpegProcess
-      .complexFilter([videoFilter], ['out'])
-      .outputOptions([
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-tune', 'zerolatency',
-        '-profile:v', 'baseline',
-        '-level', '3.1',
-        '-g', '30',
-        '-keyint_min', '30',
-        '-sc_threshold', '0',
-        '-r', '25',
-        '-pix_fmt', 'yuv420p',
-        '-b:v', '2000k',
-        '-maxrate', '2500k',
-        '-bufsize', '5000k',
-        '-hls_time', '4',
-        '-hls_list_size', '6',
-        '-hls_flags', 'delete_segments+independent_segments+round_durations',
-        '-hls_segment_filename', path.join(hlsOutputFolder, 'segment%d.ts'),
-        '-hls_playlist_type', 'event',
-        '-f', 'hls',
-        '-y'
-      ])
-      .output(outputPath)
-      .on('start', (cmd: string) => {
-        console.log('HLS Composition started successfully');
-        console.log('Command:', cmd);
-      })
-      .on('progress', (progress: any) => {
-        if (progress.percent) {
-          console.log('HLS Processing: ' + progress.percent + '% done, time: ' + progress.timemark);
-        }
-      })
-      .on('stderr', (stderrLine: string) => {
-        // Filter out less important messages but keep errors
-        if (stderrLine.includes('Error') || stderrLine.includes('Invalid') || stderrLine.includes('Could not')) {
-          console.log('FFMPEG ERROR:', stderrLine);
-        } else if (stderrLine.includes('frame=') && stderrLine.includes('fps=')) {
-          // Progress updates - log less frequently
-          if (Math.random() < 0.1) { // Log only 10% of progress messages
-            console.log('FFMPEG Progress:', stderrLine.trim());
-          }
-        }
-      })
-      .on('error', (err: Error) => {
-        console.error('HLS Composition error:', err.message);
-        console.error('Full error:', err);
-        hlsComposition.isComposing = false;
-        hlsComposition.ffmpegProcess = null;
-        
-        // Always create status video when transcoding fails
-        console.log('VP8 transcoding failed, creating live stream status video...');
-        createStaticInformationalStream();
-      })
-      .on('end', () => {
-        console.log('HLS Composition ended');
-        hlsComposition.isComposing = false;
-        hlsComposition.ffmpegProcess = null;
-      })
-      .run();
-
   } catch (error) {
     console.error('Error starting HLS composition:', error);
     hlsComposition.isComposing = false;
@@ -1242,109 +1211,709 @@ a=imageattr:${videoCodec.payloadType} send [x=1280,y=720] recv [x=1280,y=720]
   }
 }
 
-// Function to create a live informational HLS stream when VP8 decoding fails
-function createLiveInformationalStream() {
+async function createSingleStreamHls(streamId: string, streamInfo: any) {
+  // Create SDP file for the stream
+  const sdpPath = path.join(hlsOutputFolder, `stream_${streamId}.sdp`);
+  const sdpContent = createSdpForStream(streamInfo);
+  console.log('Generated SDP content:\n', sdpContent);
+  fs.writeFileSync(sdpPath, sdpContent);
+  
+  // Ensure the playlist file is deleted before FFmpeg tries to write
   try {
-    console.log('Generating live informational HLS stream...');
+    const finalOutputPath = path.join(hlsOutputFolder, 'playlist.m3u8');
+    if (fs.existsSync(finalOutputPath)) {
+      fs.unlinkSync(finalOutputPath);
+      console.log('Deleted existing playlist.m3u8');
+    }
+  } catch (err) {
+    console.warn('Could not delete existing playlist:', err);
+  }
+  
+  // Use native path separator for Windows
+  const outputPath = path.join(hlsOutputFolder, 'playlist.m3u8');
+  const segmentPath = path.join(hlsOutputFolder, 'segment_%03d.ts');
+  
+  // Use direct spawn instead of fluent-ffmpeg for better control
+  const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+  
+  // For Windows, use absolute paths but ensure they're properly formatted
+  const absoluteSdpPath = path.resolve(sdpPath);
+  const absoluteOutputPath = path.resolve(outputPath);
+  const absoluteSegmentPath = path.resolve(segmentPath);
+  
+  const args = [
+    '-protocol_whitelist', 'file,udp,rtp',
+    '-fflags', '+genpts+igndts',
+    '-use_wallclock_as_timestamps', '1',
+    '-thread_queue_size', '4096',
+    '-analyzeduration', '2000000',
+    '-probesize', '2000000',
+    '-max_delay', '500000',
+    '-reorder_queue_size', '16',
+    '-i', absoluteSdpPath,  // Use absolute path
+    '-vcodec', 'copy',
+    '-acodec', 'aac',
+    '-b:a', '128k',
+    '-ar', '44100',
+    '-f', 'hls',
+    '-hls_time', '2',
+    '-hls_list_size', '10',
+    '-hls_flags', 'delete_segments+append_list',
+    '-hls_segment_filename', absoluteSegmentPath,
+    '-hls_segment_type', 'mpegts',
+    '-start_number', '0',
+    '-y',
+    absoluteOutputPath
+  ];
+  
+  console.log('Starting FFmpeg with command:', ffmpegPath, args.join(' '));
+  
+  const ffmpegProcess = spawn(ffmpegPath, args, {
+    cwd: process.cwd(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: true  // Use shell on Windows to handle paths better
+  });
+  
+  hlsComposition.ffmpegProcess = ffmpegProcess;
+  hlsComposition.isComposing = false;
+  
+  ffmpegProcess.stderr.on('data', (data: Buffer) => {
+    const line = data.toString();
+    // Log ALL output for debugging
+    console.log('HLS FFMPEG:', line.trim());
+  });
+  
+  ffmpegProcess.on('error', (err: Error) => {
+    console.error('HLS Composition spawn error:', err);
+    hlsComposition.ffmpegProcess = null;
+    hlsComposition.isComposing = false;
+    createStaticInformationalStream();
+  });
+  
+  ffmpegProcess.on('exit', (code: number | null, signal: string | null) => {
+    console.log('HLS FFmpeg process exited with code:', code, 'signal:', signal);
+    hlsComposition.ffmpegProcess = null;
+    hlsComposition.isComposing = false;
     
-    const activeStreamCount = hlsComposition.activeStreams.size;
-    
-    // Create a simple colored test pattern with basic text
-    const informationalProcess = ffmpeg()
-      .input('testsrc=duration=3600:size=1280x720:rate=25')
-      .inputOptions(['-f', 'lavfi'])
-      .videoFilters([
-        'format=yuv420p',
-        `drawtext=text='LIVE STREAMING SYSTEM':fontsize=48:fontcolor=white:x=(w-text_w)/2:y=150:box=1:boxcolor=blue@0.8`,
-        `drawtext=text='Active WebRTC Streams\\: ${activeStreamCount}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=250:box=1:boxcolor=red@0.8`,
-        `drawtext=text='Status\\: VP8 to HLS transcoding issue':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=350:box=1:boxcolor=black@0.8`,
-        `drawtext=text='WebRTC peer-to-peer works on /stream':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=400:box=1:boxcolor=black@0.8`,
-        `drawtext=text='Architecture\\: Correct (WebRTC → HLS)':fontsize=24:fontcolor=green:x=(w-text_w)/2:y=450:box=1:boxcolor=black@0.8`,
-        `drawtext=text='Issue\\: FFMPEG VP8 codec compatibility':fontsize=24:fontcolor=orange:x=(w-text_w)/2:y=500:box=1:boxcolor=black@0.8`
-      ])
-      .videoCodec('libx264')
-      .outputOptions([
-        '-preset', 'veryfast',
-        '-tune', 'zerolatency',
-        '-profile:v', 'baseline',
-        '-level', '3.1',
-        '-g', '30',
-        '-r', '25',
-        '-pix_fmt', 'yuv420p',
-        '-b:v', '1500k',
-        '-hls_time', '4',
-        '-hls_list_size', '6',
-        '-hls_flags', 'delete_segments+independent_segments',
-        '-hls_segment_filename', path.join(hlsOutputFolder, 'info_segment%d.ts'),
-        '-f', 'hls',
-        '-y'
-      ])
-      .output(path.join(hlsOutputFolder, 'playlist.m3u8'))
-      .on('start', (cmd: string) => {
-        console.log('Live informational HLS stream started successfully');
-        console.log('Showing active stream count:', activeStreamCount);
-      })
-      .on('end', () => {
-        console.log('Live informational HLS stream generation completed');
-      })
-      .on('error', (err: Error) => {
-        console.error('Informational HLS generation error:', err);
-        // If even the informational stream fails, create a working basic stream
-        createBasicWorkingStream();
-      })
-      .run();
+    if (code !== 0 && code !== null) {
+      console.log('FFmpeg failed, creating status video...');
+      createStaticInformationalStream();
+    }
+  });
+  
+  // Resume consumer after a delay
+  setTimeout(async () => {
+    if (streamInfo.videoConsumer && !streamInfo.videoConsumer.closed && streamInfo.videoConsumer.paused) {
+      await streamInfo.videoConsumer.resume();
+      console.log(`Consumer resumed for producer ${streamId}`);
       
+      // Request keyframe after resuming
+      setTimeout(async () => {
+        if (streamInfo.videoConsumer && !streamInfo.videoConsumer.closed) {
+          await streamInfo.videoConsumer.requestKeyFrame();
+          console.log(`Keyframe requested for producer ${streamId}`);
+        }
+      }, 1000);
+    }
+  }, 2000);
+}
+
+async function createMosaicHls(streams: Array<[string, any]>) {
+  // Create SDP files for all streams
+  const sdpFiles: string[] = [];
+  
+  for (const [streamId, streamInfo] of streams) {
+    const sdpPath = path.join(hlsOutputFolder, `stream_${streamId}.sdp`);
+    const sdpContent = createSdpForStream(streamInfo);
+    fs.writeFileSync(sdpPath, sdpContent);
+    sdpFiles.push(path.resolve(sdpPath));
+    console.log(`Created SDP for stream ${streamId}`);
+  }
+  
+  // Ensure the playlist file is deleted before FFmpeg tries to write
+  try {
+    const finalOutputPath = path.join(hlsOutputFolder, 'playlist.m3u8');
+    if (fs.existsSync(finalOutputPath)) {
+      fs.unlinkSync(finalOutputPath);
+      console.log('Deleted existing playlist.m3u8');
+    }
+  } catch (err) {
+    console.warn('Could not delete existing playlist:', err);
+  }
+  
+  const outputPath = path.join(hlsOutputFolder, 'playlist.m3u8');
+  const segmentPath = path.join(hlsOutputFolder, 'segment_%03d.ts');
+  
+  const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+  
+  // Build FFmpeg command for mosaic
+  const args: string[] = [];
+  
+  // Add inputs
+  for (const sdpFile of sdpFiles) {
+    args.push(
+      '-protocol_whitelist', 'file,udp,rtp',
+      '-fflags', '+genpts+igndts',
+      '-use_wallclock_as_timestamps', '1',
+      '-thread_queue_size', '4096',
+      '-analyzeduration', '2000000',
+      '-probesize', '2000000',
+      '-max_delay', '500000',
+      '-reorder_queue_size', '16',
+      '-i', sdpFile
+    );
+  }
+  
+  // Build filter complex for grid layout
+  let filterComplex = '';
+  const streamCount = streams.length;
+  
+  if (streamCount === 2) {
+    // Side by side layout
+    filterComplex = '[0:v]scale=640:480,setpts=PTS-STARTPTS[v0];' +
+                   '[1:v]scale=640:480,setpts=PTS-STARTPTS[v1];' +
+                   '[v0][v1]hstack=inputs=2[out]';
+  } else if (streamCount === 3) {
+    // 2 on top, 1 on bottom
+    filterComplex = '[0:v]scale=640:480,setpts=PTS-STARTPTS[v0];' +
+                   '[1:v]scale=640:480,setpts=PTS-STARTPTS[v1];' +
+                   '[2:v]scale=640:480,setpts=PTS-STARTPTS[v2];' +
+                   '[v0][v1]hstack=inputs=2[top];' +
+                   '[v2]scale=1280:480[bottom];' +
+                   '[top][bottom]vstack=inputs=2[out]';
+  } else if (streamCount === 4) {
+    // 2x2 grid
+    filterComplex = '[0:v]scale=640:480,setpts=PTS-STARTPTS[v0];' +
+                   '[1:v]scale=640:480,setpts=PTS-STARTPTS[v1];' +
+                   '[2:v]scale=640:480,setpts=PTS-STARTPTS[v2];' +
+                   '[3:v]scale=640:480,setpts=PTS-STARTPTS[v3];' +
+                   '[v0][v1]hstack=inputs=2[top];' +
+                   '[v2][v3]hstack=inputs=2[bottom];' +
+                   '[top][bottom]vstack=inputs=2[out]';
+  } else {
+    // For more streams, create a simple grid
+    const cols = Math.ceil(Math.sqrt(streamCount));
+    const rows = Math.ceil(streamCount / cols);
+    const cellWidth = Math.floor(1280 / cols);
+    const cellHeight = Math.floor(720 / rows);
+    
+    // Scale all inputs
+    for (let i = 0; i < streamCount; i++) {
+      filterComplex += `[${i}:v]scale=${cellWidth}:${cellHeight},setpts=PTS-STARTPTS[v${i}];`;
+    }
+    
+    // Create rows
+    let currentIdx = 0;
+    for (let row = 0; row < rows; row++) {
+      const rowInputs = [];
+      for (let col = 0; col < cols && currentIdx < streamCount; col++) {
+        rowInputs.push(`[v${currentIdx}]`);
+        currentIdx++;
+      }
+      
+      if (rowInputs.length > 0) {
+        filterComplex += rowInputs.join('') + `hstack=inputs=${rowInputs.length}[row${row}];`;
+      }
+    }
+    
+    // Stack rows
+    const rowLabels = [];
+    for (let row = 0; row < rows; row++) {
+      if (row * cols < streamCount) {
+        rowLabels.push(`[row${row}]`);
+      }
+    }
+    filterComplex += rowLabels.join('') + `vstack=inputs=${rowLabels.length}[out]`;
+  }
+  
+  args.push(
+    '-filter_complex', filterComplex,
+    '-map', '[out]',
+    '-vcodec', 'libx264',
+    '-preset', 'veryfast',
+    '-tune', 'zerolatency',
+    '-profile:v', 'baseline',
+    '-level', '3.1',
+    '-pix_fmt', 'yuv420p',
+    '-g', '30',
+    '-keyint_min', '30',
+    '-sc_threshold', '0',
+    '-b:v', '2000k',
+    '-maxrate', '2500k',
+    '-bufsize', '4000k',
+    '-r', '30',
+    '-f', 'hls',
+    '-hls_time', '2',
+    '-hls_list_size', '10',
+    '-hls_flags', 'delete_segments+append_list',
+    '-hls_segment_filename', path.resolve(segmentPath),
+    '-hls_segment_type', 'mpegts',
+    '-start_number', '0',
+    '-y',
+    path.resolve(outputPath)
+  );
+  
+  console.log('Starting FFmpeg mosaic with command:', ffmpegPath, args.join(' '));
+  
+  const ffmpegProcess = spawn(ffmpegPath, args, {
+    cwd: process.cwd(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: true
+  });
+  
+  hlsComposition.ffmpegProcess = ffmpegProcess;
+  hlsComposition.isComposing = false;
+  
+  ffmpegProcess.stderr.on('data', (data: Buffer) => {
+    const line = data.toString();
+    // Log ALL output for debugging
+    console.log('HLS FFMPEG:', line.trim());
+  });
+  
+  ffmpegProcess.on('error', (err: Error) => {
+    console.error('HLS Mosaic spawn error:', err);
+    hlsComposition.ffmpegProcess = null;
+    hlsComposition.isComposing = false;
+    createStaticInformationalStream();
+  });
+  
+  ffmpegProcess.on('exit', (code: number | null, signal: string | null) => {
+    console.log('HLS Mosaic FFmpeg process exited with code:', code, 'signal:', signal);
+    hlsComposition.ffmpegProcess = null;
+    hlsComposition.isComposing = false;
+    
+    if (code !== 0 && code !== null) {
+      console.log('FFmpeg failed, creating status video...');
+      createStaticInformationalStream();
+    }
+  });
+  
+  // Resume all consumers after a delay
+  setTimeout(async () => {
+    for (const [streamId, streamInfo] of streams) {
+      if (streamInfo.videoConsumer && !streamInfo.videoConsumer.closed && streamInfo.videoConsumer.paused) {
+        await streamInfo.videoConsumer.resume();
+        console.log(`Consumer resumed for producer ${streamId}`);
+        
+        // Request keyframe after resuming
+        setTimeout(async () => {
+          if (streamInfo.videoConsumer && !streamInfo.videoConsumer.closed) {
+            await streamInfo.videoConsumer.requestKeyFrame();
+            console.log(`Keyframe requested for producer ${streamId}`);
+          }
+        }, 500);
+      }
+    }
+  }, 2000);
+}
+
+function createSdpForStream(streamInfo: any): string {
+  const videoPort = streamInfo.rtpPorts.video;
+  const audioPort = streamInfo.rtpPorts.audio;
+  
+  let sdp = `v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=Stream
+c=IN IP4 127.0.0.1
+t=0 0
+`;
+
+  // Add video media line
+  if (streamInfo.videoConsumer) {
+    const videoParams = streamInfo.videoConsumer.rtpParameters;
+    const videoCodec = videoParams.codecs[0];
+    
+    sdp += `m=video ${videoPort} RTP/AVP ${videoCodec.payloadType}
+a=rtpmap:${videoCodec.payloadType} ${videoCodec.mimeType.split('/')[1]}/${videoCodec.clockRate}
+`;
+    
+    if (videoCodec.parameters) {
+      const fmtpParams = Object.entries(videoCodec.parameters)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(';');
+      if (fmtpParams) {
+        sdp += `a=fmtp:${videoCodec.payloadType} ${fmtpParams}
+`;
+      }
+    }
+    
+    // Add recvonly attribute for FFmpeg
+    sdp += `a=recvonly
+`;
+  }
+  
+  // Add audio media line if available
+  if (streamInfo.audioConsumer) {
+    const audioParams = streamInfo.audioConsumer.rtpParameters;
+    const audioCodec = audioParams.codecs[0];
+    
+    sdp += `m=audio ${audioPort} RTP/AVP ${audioCodec.payloadType}
+a=rtpmap:${audioCodec.payloadType} ${audioCodec.mimeType.split('/')[1]}/${audioCodec.clockRate}/${audioCodec.channels || 2}
+`;
+    
+    // Add recvonly attribute for FFmpeg
+    sdp += `a=recvonly
+`;
+  }
+  
+  return sdp;
+}
+
+function createLiveStatusStream(activeStreamCount: number) {
+  try {
+    console.log(`Creating live status stream for ${activeStreamCount} active WebRTC streams...`);
+    
+    // Just create a working playlist without trying to use lavfi
+    createWorkingPlaylist(activeStreamCount);
+    
   } catch (error) {
-    console.error('Error creating live informational HLS stream:', error);
-    createBasicWorkingStream();
+    console.error('Error creating live status stream:', error);
+    createMinimalHlsPlaylist();
   }
 }
 
-// Create a basic working HLS stream as last resort
-function createBasicWorkingStream() {
+function createSimpleLiveStream(activeStreamCount: number) {
+  // Skip to file-based approach directly
+  createFileBasedStream();
+}
+
+function createFileBasedStream() {
   try {
-    console.log('Creating basic working HLS stream...');
+    console.log('Creating file-based HLS stream...');
+    
+    // For Windows, we'll create a simple working playlist directly
+    const activeStreamCount = hlsComposition.activeStreams.size;
+    createWorkingPlaylist(activeStreamCount);
+    
+  } catch (error) {
+    console.error('Error in file-based stream creation:', error);
+    createMinimalHlsPlaylist();
+  }
+}
+
+function createLiveHlsFromVideo(inputPath: string, outputPath: string, activeStreamCount: number) {
+  try {
+    console.log('Creating live HLS stream from video file...');
+    
+    // First, ensure we have a valid demo segment
+    const demoSegmentPath = path.join(hlsOutputFolder, 'demo-segment.ts');
+    
+    if (!fs.existsSync(demoSegmentPath)) {
+      // Create a demo segment from the test pattern
+      const createSegment = ffmpeg()
+        .input(inputPath)
+        .videoCodec('libx264')
+        .outputOptions([
+          '-preset', 'fast',
+          '-profile:v', 'baseline',
+          '-level', '3.1',
+          '-pix_fmt', 'yuv420p',
+          '-t', '10',
+          '-f', 'mpegts',
+          '-y'
+        ])
+        .output(demoSegmentPath)
+        .on('end', () => {
+          console.log('Demo segment created');
+          createWorkingPlaylist(activeStreamCount);
+        })
+        .on('error', (err: Error) => {
+          console.error('Error creating demo segment:', err);
+          createWorkingPlaylist(activeStreamCount);
+        });
+      
+      createSegment.run();
+    } else {
+      createWorkingPlaylist(activeStreamCount);
+    }
+    
+  } catch (error) {
+    console.error('Error creating HLS from video:', error);
+    createWorkingPlaylist(activeStreamCount);
+  }
+}
+
+function createStaticInformationalStream() {
+  try {
+    console.log('Creating static informational HLS stream...');
     
     const activeStreamCount = hlsComposition.activeStreams.size;
     
-    // Create a very simple test pattern that should always work
-    const basicProcess = ffmpeg()
-      .input('testsrc=duration=3600:size=1280x720:rate=25')
-      .inputOptions(['-f', 'lavfi'])
-      .videoCodec('libx264')
-      .outputOptions([
-        '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
-        '-g', '30',
-        '-r', '25',
-        '-pix_fmt', 'yuv420p',
-        '-b:v', '1000k',
-        '-hls_time', '4',
-        '-hls_list_size', '6',
-        '-hls_flags', 'delete_segments+independent_segments',
-        '-hls_segment_filename', path.join(hlsOutputFolder, 'basic_segment%d.ts'),
-        '-f', 'hls',
-        '-y'
-      ])
-      .output(path.join(hlsOutputFolder, 'playlist.m3u8'))
-      .on('start', (cmd: string) => {
-        console.log('Basic HLS stream started successfully');
-        console.log('Active streams:', activeStreamCount);
-      })
-      .on('end', () => {
-        console.log('Basic HLS stream generation completed');
-      })
-      .on('error', (err: Error) => {
-        console.error('Basic HLS generation error:', err);
-        // If even this fails, create minimal playlist
-        createMinimalHlsPlaylist();
-      })
-      .run();
+    // If there are active streams, create a live HLS stream
+    if (activeStreamCount > 0) {
+      console.log('Active streams detected, creating live informational HLS stream...');
       
+      // Stop any existing FFMPEG process
+      if (hlsComposition.ffmpegProcess) {
+        try {
+          hlsComposition.ffmpegProcess.kill('SIGTERM');
+          hlsComposition.ffmpegProcess = null;
+        } catch (error) {
+          console.error('Error stopping existing FFMPEG process:', error);
+        }
+      }
+      
+      // Try to create live status stream
+      createLiveStatusStream(activeStreamCount);
+      return;
+    }
+    
+    // No active streams, create VOD demo
+    createVodInformationalStream(activeStreamCount);
+    
   } catch (error) {
-    console.error('Error creating basic HLS stream:', error);
+    console.error('Error creating static informational HLS stream:', error);
     createMinimalHlsPlaylist();
   }
+}
+
+function createVodInformationalStream(activeStreamCount: number) {
+  try {
+    const timestamp = new Date().toLocaleTimeString();
+    
+    // Create a working demo video segment using FFMPEG
+    const demoSegmentPath = path.join(hlsOutputFolder, 'demo-segment.ts');
+    
+    if (!fs.existsSync(demoSegmentPath)) {
+      console.log('Creating demo segment without lavfi...');
+      
+      // Since lavfi is not available, just create a minimal TS file
+      createWorkingPlaylist(activeStreamCount);
+    } else {
+      createWorkingPlaylist(activeStreamCount);
+    }
+  } catch (error) {
+    console.error('Error creating VOD informational stream:', error);
+    createMinimalHlsPlaylist();
+  }
+}
+
+function createWorkingPlaylist(activeStreamCount: number) {
+  try {
+    // First ensure demo-segment.ts exists
+    const demoSegmentPath = path.join(hlsOutputFolder, 'demo-segment.ts');
+    
+    if (!fs.existsSync(demoSegmentPath)) {
+      console.log('Demo segment not found, creating one...');
+      
+      // Create a simple black video file first, then convert to TS
+      const tempVideoPath = path.join(hlsOutputFolder, 'temp_black.mp4');
+      
+      // First, try to create a black video using FFmpeg without lavfi
+      // We'll create a very small black frame as a raw file
+      const width = 320;
+      const height = 240;
+      const frameSize = width * height * 1.5; // YUV420
+      const blackFrame = Buffer.alloc(frameSize);
+      
+      // Y plane (luma) - all zeros for black
+      // U and V planes - 128 for neutral color
+      const ySize = width * height;
+      const uvSize = ySize / 4;
+      
+      // Fill U and V planes with 128
+      for (let i = ySize; i < ySize + uvSize * 2; i++) {
+        blackFrame[i] = 128;
+      }
+      
+      // Write raw YUV file
+      const rawPath = path.join(hlsOutputFolder, 'black.yuv');
+      fs.writeFileSync(rawPath, new Uint8Array(blackFrame));
+      
+      // Convert raw YUV to MPEG-TS
+      const ffmpegCmd = ffmpeg()
+        .input(rawPath.replace(/\\/g, '/'))  // Convert backslashes to forward slashes for Windows
+        .inputOptions([
+          '-f', 'rawvideo',
+          '-pix_fmt', 'yuv420p',
+          '-s', `${width}x${height}`,
+          '-r', '25'
+        ])
+        .videoCodec('libx264')
+        .outputOptions([
+          '-t', '2',  // 2 seconds duration
+          '-preset', 'ultrafast',
+          '-profile:v', 'baseline',
+          '-level', '3.0',
+          '-g', '50',
+          '-b:v', '100k',
+          '-f', 'mpegts',
+          '-y'
+        ])
+        .output(demoSegmentPath.replace(/\\/g, '/'))  // Convert backslashes to forward slashes for Windows
+        .on('end', () => {
+          console.log('Demo segment created successfully');
+          
+          // Clean up temporary files
+          try {
+            fs.unlinkSync(rawPath);
+          } catch (e) {
+            // Ignore cleanup errors
+          }
+          
+          // Create the playlist
+          const workingPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:2.0,
+demo-segment.ts
+#EXT-X-ENDLIST`;
+
+          fs.writeFileSync(path.join(hlsOutputFolder, 'playlist.m3u8'), workingPlaylist);
+          console.log('Working HLS playlist created successfully');
+          console.log('Active streams:', activeStreamCount);
+        })
+        .on('error', (err: Error) => {
+          console.error('Error creating demo segment:', err);
+          
+          // Clean up temporary files
+          try {
+            fs.unlinkSync(rawPath);
+          } catch (e) {
+            // Ignore cleanup errors
+          }
+          
+          // If FFmpeg fails, create a minimal valid TS file
+          createMinimalValidTsFile(demoSegmentPath);
+          
+          // Create the playlist
+          const workingPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:2.0,
+demo-segment.ts
+#EXT-X-ENDLIST`;
+
+          fs.writeFileSync(path.join(hlsOutputFolder, 'playlist.m3u8'), workingPlaylist);
+          console.log('Working HLS playlist created successfully');
+          console.log('Active streams:', activeStreamCount);
+        })
+        .run();
+      
+      return; // Exit early since ffmpeg will handle the rest asynchronously
+    }
+    
+    // Demo segment exists, just create the playlist
+    const workingPlaylist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:2.0,
+demo-segment.ts
+#EXT-X-ENDLIST`;
+
+    fs.writeFileSync(path.join(hlsOutputFolder, 'playlist.m3u8'), workingPlaylist);
+    console.log('Working HLS playlist created successfully');
+    console.log('Active streams:', activeStreamCount);
+    
+  } catch (error) {
+    console.error('Error creating working playlist:', error);
+    createMinimalHlsPlaylist();
+  }
+}
+
+function createMinimalValidTsFile(filePath: string) {
+  // Create a more complete MPEG-TS file with PAT, PMT, and some video packets
+  const tsPacketSize = 188;
+  const syncByte = 0x47;
+  const packets = 1000;
+  
+  const buffer = Buffer.alloc(tsPacketSize * packets);
+  
+  // PAT packet
+  let packetIndex = 0;
+  buffer[packetIndex * tsPacketSize] = syncByte;
+  buffer[packetIndex * tsPacketSize + 1] = 0x40; // Payload unit start
+  buffer[packetIndex * tsPacketSize + 2] = 0x00; // PID 0
+  buffer[packetIndex * tsPacketSize + 3] = 0x10; // Payload only
+  
+  // PAT payload
+  const patStart = packetIndex * tsPacketSize + 4;
+  buffer[patStart] = 0x00; // Pointer
+  buffer[patStart + 1] = 0x00; // Table ID
+  buffer[patStart + 2] = 0xB0; // Section syntax
+  buffer[patStart + 3] = 0x0D; // Section length
+  buffer[patStart + 4] = 0x00; // TS ID high
+  buffer[patStart + 5] = 0x01; // TS ID low
+  buffer[patStart + 6] = 0xC1; // Version
+  buffer[patStart + 7] = 0x00; // Section number
+  buffer[patStart + 8] = 0x00; // Last section
+  buffer[patStart + 9] = 0x00; // Program high
+  buffer[patStart + 10] = 0x01; // Program low
+  buffer[patStart + 11] = 0xE1; // PMT PID high
+  buffer[patStart + 12] = 0x00; // PMT PID low
+  
+  // CRC32 placeholder
+  buffer[patStart + 13] = 0x00;
+  buffer[patStart + 14] = 0x00;
+  buffer[patStart + 15] = 0x00;
+  buffer[patStart + 16] = 0x00;
+  
+  // Fill rest with padding
+  for (let i = patStart + 17; i < (packetIndex + 1) * tsPacketSize; i++) {
+    buffer[i] = 0xFF;
+  }
+  
+  // PMT packet
+  packetIndex++;
+  buffer[packetIndex * tsPacketSize] = syncByte;
+  buffer[packetIndex * tsPacketSize + 1] = 0x41; // Payload unit start
+  buffer[packetIndex * tsPacketSize + 2] = 0x00; // PID 256
+  buffer[packetIndex * tsPacketSize + 3] = 0x10; // Payload only
+  
+  // PMT payload
+  const pmtStart = packetIndex * tsPacketSize + 4;
+  buffer[pmtStart] = 0x00; // Pointer
+  buffer[pmtStart + 1] = 0x02; // Table ID
+  buffer[pmtStart + 2] = 0xB0; // Section syntax
+  buffer[pmtStart + 3] = 0x17; // Section length
+  buffer[pmtStart + 4] = 0x00; // Program high
+  buffer[pmtStart + 5] = 0x01; // Program low
+  buffer[pmtStart + 6] = 0xC1; // Version
+  buffer[pmtStart + 7] = 0x00; // Section number
+  buffer[pmtStart + 8] = 0x00; // Last section
+  buffer[pmtStart + 9] = 0xE1; // PCR PID high
+  buffer[pmtStart + 10] = 0x00; // PCR PID low
+  buffer[pmtStart + 11] = 0xF0; // Program info length high
+  buffer[pmtStart + 12] = 0x00; // Program info length low
+  
+  // Video stream
+  buffer[pmtStart + 13] = 0x1B; // H.264 stream type
+  buffer[pmtStart + 14] = 0xE1; // Elementary PID high
+  buffer[pmtStart + 15] = 0x00; // Elementary PID low
+  buffer[pmtStart + 16] = 0xF0; // ES info length high
+  buffer[pmtStart + 17] = 0x00; // ES info length low
+  
+  // CRC32 placeholder
+  buffer[pmtStart + 18] = 0x00;
+  buffer[pmtStart + 19] = 0x00;
+  buffer[pmtStart + 20] = 0x00;
+  buffer[pmtStart + 21] = 0x00;
+  
+  // Fill rest with padding
+  for (let i = pmtStart + 22; i < (packetIndex + 1) * tsPacketSize; i++) {
+    buffer[i] = 0xFF;
+  }
+  
+  // Fill remaining packets with null packets
+  for (let i = 2; i < packets; i++) {
+    const offset = i * tsPacketSize;
+    buffer[offset] = syncByte;
+    buffer[offset + 1] = 0x1F;
+    buffer[offset + 2] = 0xFF;
+    buffer[offset + 3] = 0x10;
+    for (let j = 4; j < tsPacketSize; j++) {
+      buffer[offset + j] = 0xFF;
+    }
+  }
+  
+  fs.writeFileSync(filePath, new Uint8Array(buffer));
+  console.log('Created minimal valid TS file');
 }
 
 // Create a minimal HLS playlist as last resort
@@ -1356,102 +1925,12 @@ function createMinimalHlsPlaylist() {
 #EXT-X-MEDIA-SEQUENCE:0
 #EXT-X-PLAYLIST-TYPE:VOD
 #EXTINF:10.0,
+demo-segment.ts
 #EXT-X-ENDLIST`;
     
     fs.writeFileSync(path.join(hlsOutputFolder, 'playlist.m3u8'), minimalPlaylist);
     console.log('Created minimal HLS playlist as fallback');
   } catch (error) {
     console.error('Failed to create even minimal HLS playlist:', error);
-  }
-}
-
-// Create a simple static informational HLS playlist
-function createStaticInformationalStream() {
-  try {
-    console.log('Creating static informational HLS stream...');
-    
-    const activeStreamCount = hlsComposition.activeStreams.size;
-    const timestamp = new Date().toLocaleTimeString();
-    
-    // Create a working demo video segment using FFMPEG
-    const demoSegmentPath = path.join(hlsOutputFolder, 'demo-segment.ts');
-    
-    if (!fs.existsSync(demoSegmentPath)) {
-      console.log('Creating live stream status video segment...');
-      
-      const demoProcess = ffmpeg()
-        .input('testsrc=duration=10:size=1280x720:rate=25')
-        .inputOptions(['-f', 'lavfi'])
-        .videoFilters([
-          'format=yuv420p',
-          activeStreamCount > 0 
-            ? `drawtext=text='🔴 LIVE STREAM ACTIVE':fontsize=48:fontcolor=red:x=(w-text_w)/2:y=150:box=1:boxcolor=black@0.8`
-            : `drawtext=text='📺 LIVE STREAMING PLATFORM':fontsize=48:fontcolor=white:x=(w-text_w)/2:y=150:box=1:boxcolor=blue@0.8`,
-          `drawtext=text='Active WebRTC Streams\\: ${activeStreamCount}':fontsize=36:fontcolor=yellow:x=(w-text_w)/2:y=220:box=1:boxcolor=black@0.8`,
-          activeStreamCount > 0 
-            ? `drawtext=text='⚠️ VP8 to HLS Transcoding Issue':fontsize=32:fontcolor=orange:x=(w-text_w)/2:y=290:box=1:boxcolor=black@0.8`
-            : `drawtext=text='Ready for Live Streaming':fontsize=32:fontcolor=green:x=(w-text_w)/2:y=290:box=1:boxcolor=black@0.8`,
-          activeStreamCount > 0 
-            ? `drawtext=text='Live stream is broadcasting on /stream page':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=360:box=1:boxcolor=black@0.8`
-            : `drawtext=text='WebRTC → HLS Architecture Ready':fontsize=24:fontcolor=green:x=(w-text_w)/2:y=360:box=1:boxcolor=black@0.8`,
-          activeStreamCount > 0 
-            ? `drawtext=text='HLS transcoding blocked by VP8 codec':fontsize=24:fontcolor=red:x=(w-text_w)/2:y=410:box=1:boxcolor=black@0.8`
-            : `drawtext=text='Start streaming on /stream to see live content':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=410:box=1:boxcolor=black@0.8`,
-          activeStreamCount > 0 
-            ? `drawtext=text='Solution\\: Use H.264 codec for WebRTC':fontsize=24:fontcolor=cyan:x=(w-text_w)/2:y=460:box=1:boxcolor=black@0.8`
-            : `drawtext=text='Viewers will see HLS stream here':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=460:box=1:boxcolor=black@0.8`,
-          `drawtext=text='Last Updated\\: ${timestamp}':fontsize=20:fontcolor=gray:x=(w-text_w)/2:y=520:box=1:boxcolor=black@0.8`
-        ])
-        .videoCodec('libx264')
-        .outputOptions([
-          '-preset', 'fast',
-          '-profile:v', 'baseline',
-          '-level', '3.1',
-          '-pix_fmt', 'yuv420p',
-          '-t', '10',
-          '-y'
-        ])
-        .output(demoSegmentPath)
-        .on('start', (cmd: string) => {
-          console.log('Creating live stream status segment with command:', cmd);
-        })
-        .on('end', () => {
-          console.log('Live stream status segment created successfully');
-          createWorkingPlaylist(activeStreamCount);
-        })
-        .on('error', (err: Error) => {
-          console.error('Error creating live stream status segment:', err);
-          createMinimalHlsPlaylist();
-        })
-        .run();
-    } else {
-      createWorkingPlaylist(activeStreamCount);
-    }
-    
-  } catch (error) {
-    console.error('Error creating static informational HLS stream:', error);
-    createMinimalHlsPlaylist();
-  }
-}
-
-function createWorkingPlaylist(activeStreamCount: number) {
-  try {
-    // Create a working HLS playlist that references the demo segment
-    const workingPlaylist = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:10
-#EXT-X-MEDIA-SEQUENCE:0
-#EXT-X-PLAYLIST-TYPE:VOD
-#EXTINF:10.0,
-demo-segment.ts
-#EXT-X-ENDLIST`;
-
-    fs.writeFileSync(path.join(hlsOutputFolder, 'playlist.m3u8'), workingPlaylist);
-    console.log('Working HLS playlist created successfully');
-    console.log('Active streams:', activeStreamCount);
-    
-  } catch (error) {
-    console.error('Error creating working playlist:', error);
-    createMinimalHlsPlaylist();
   }
 }

@@ -98,29 +98,33 @@ export default function StreamPage() {
     if (!socket || !socket.connected) { console.warn('loadDevice: Socket not available or not connected.'); return; }
     try {
       console.log('Requesting Router RTP Capabilities...');
-      socket.emit('getRouterRtpCapabilities', (response: mediasoupClient.types.RtpCapabilities | ServerCallbackResponse) => {
-        if (!socket || !socket.connected) {
-            console.warn('Socket disconnected or became null before RTP capabilities callback executed.');
-            return;
-        }
-        if (response && typeof response === 'object' && 'error' in response && response.error) {
-            console.error('Error getting Router RTP Capabilities:', response.error);
-            return;
+      socket.emit('getRouterRtpCapabilities', async (response: mediasoupClient.types.RtpCapabilities | { error: string }) => {
+        if ('error' in response) {
+          console.error('Error getting router RTP capabilities:', response.error);
+          return;
         }
         console.log('Received Router RTP Capabilities:', response as mediasoupClient.types.RtpCapabilities);
         const device = new mediasoupClient.Device();
-        device.load({ routerRtpCapabilities: response as mediasoupClient.types.RtpCapabilities })
-          .then(() => {
-            setMediasoupDevice(device);
-            console.log('Mediasoup Device loaded successfully', device);
-            if (socket && socket.connected) {
-              console.log('Emitting clientReadyForExistingProducers');
-              socket.emit('clientReadyForExistingProducers');
-            }
-          })
-          .catch(loadError => {
-            console.error('Error loading Mediasoup device with RTP capabilities:', loadError);
-          });
+        try {
+          await device.load({ routerRtpCapabilities: response as mediasoupClient.types.RtpCapabilities });
+          console.log('Mediasoup device loaded successfully.');
+          
+          // Log available codecs
+          const videoCodecs = device.rtpCapabilities.codecs?.filter(codec => codec.kind === 'video');
+          console.log('Available video codecs:', videoCodecs?.map(c => c.mimeType));
+          const audioCodecs = device.rtpCapabilities.codecs?.filter(codec => codec.kind === 'audio');
+          console.log('Available audio codecs:', audioCodecs?.map(c => c.mimeType));
+          
+          setMediasoupDevice(device);
+          
+          // After device is loaded, tell server we're ready for existing producers
+          if (socket && socket.connected) {
+            console.log('Notifying server that client is ready for existing producers...');
+            socket.emit('clientReadyForExistingProducers');
+          }
+        } catch (loadError) {
+          console.error('Error loading Mediasoup device with RTP capabilities:', loadError);
+        }
       });
     } catch (error) {
       console.error('Error in loadDevice function (emit failed or other sync error):', error);
@@ -204,14 +208,30 @@ export default function StreamPage() {
                     console.log('Video producer already exists or is being created.');
                 } else {
                     setIsProducingVideo(true);
-                    const videoProd = await transport.produce({ 
+                    
+                    // Check for H.264 codec support
+                    const videoCodecs = device.rtpCapabilities.codecs?.filter(codec => codec.kind === 'video');
+                    const h264Codec = videoCodecs?.find(codec => codec.mimeType.toLowerCase() === 'video/h264');
+                    
+                    const produceParams: any = {
                         track: videoTrack,
                         appData: { mediaType: 'video', transportId: transport.id } as ExtendedAppData,
-                        codecOptions : { videoGoogleStartBitrate : 1000 }
-                    });
+                        codecOptions: { videoGoogleStartBitrate: 1000 }
+                    };
+                    
+                    // If H.264 is available, prefer it
+                    if (h264Codec) {
+                        produceParams.codec = h264Codec;
+                        console.log('Using H.264 codec for video production');
+                    } else {
+                        console.log('H.264 not available, using default codec');
+                    }
+                    
+                    const videoProd = await transport.produce(produceParams);
                     setVideoProducer(videoProd);
                     setIsProducingVideo(false);
                     console.log('Video producer created:', videoProd);
+                    console.log('Video codec being used:', videoProd.rtpParameters.codecs[0]);
                     videoProd.on('trackended', () => {
                       console.log('Video track ended');
                       if (!videoProd.closed) videoProd.close(); setVideoProducer(null); 

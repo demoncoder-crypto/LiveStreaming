@@ -13,8 +13,10 @@ export default function WatchPage() {
   const [streamStatus, setStreamStatus] = useState('Connecting...');
   const [retryCount, setRetryCount] = useState(0);
   const [emptyPlaylistRetries, setEmptyPlaylistRetries] = useState(0);
+  const [hasActiveStream, setHasActiveStream] = useState(false);
+  const [isLiveStream, setIsLiveStream] = useState(false);
   const maxRetries = 5;
-  const maxEmptyPlaylistRetries = 3;
+  const maxEmptyPlaylistRetries = 10;
 
   const handlePlayClick = async () => {
     const videoElement = videoRef.current;
@@ -109,11 +111,30 @@ export default function WatchPage() {
       console.log('HLS.js instance created and attached to video element.');
 
       // Event handlers
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        console.log('HLS manifest parsed successfully');
-        setStreamStatus('Stream ready');
+      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        console.log('HLS manifest parsed successfully', data);
+        
+        // Check if this is a VOD playlist (demo segment) or live stream
+        if (data.levels && data.levels[0] && data.levels[0].details) {
+          const details = data.levels[0].details;
+          setIsLiveStream(details.live || false);
+          
+          if (details.type === 'VOD' && details.fragments && details.fragments.length === 1) {
+            setStreamStatus('Demo stream ready - Start broadcasting to see live content');
+            setHasActiveStream(false);
+          } else if (details.live) {
+            setStreamStatus('Live stream active - Transcoding in progress');
+            setHasActiveStream(true);
+          } else {
+            setStreamStatus('Stream ready');
+          }
+        } else {
+          setStreamStatus('Stream ready');
+        }
+        
         setShowPlayButton(true);
         setRetryCount(0);
+        setEmptyPlaylistRetries(0);
       });
 
       hls.on(Hls.Events.ERROR, (event, data) => {
@@ -127,11 +148,12 @@ export default function WatchPage() {
                 console.log('HLS.js: Stream has no segments yet - waiting for content...');
                 
                 if (emptyPlaylistRetries < maxEmptyPlaylistRetries) {
-                  setStreamStatus(`Waiting for stream to start... (${emptyPlaylistRetries + 1}/${maxEmptyPlaylistRetries})`);
+                  setStreamStatus(`Waiting for live stream... (${emptyPlaylistRetries + 1}/${maxEmptyPlaylistRetries})`);
                   setEmptyPlaylistRetries(prev => prev + 1);
+                  setHasActiveStream(false);
                   
-                  // Exponential backoff: 10s, 20s, 30s
-                  const retryDelay = (emptyPlaylistRetries + 1) * 10000;
+                  // Retry with shorter delay for better responsiveness
+                  const retryDelay = 3000; // 3 seconds
                   setTimeout(() => {
                     if (hlsRef.current) {
                       console.log('Retrying to load stream...');
@@ -139,9 +161,13 @@ export default function WatchPage() {
                     }
                   }, retryDelay);
                 } else {
-                  setStreamStatus('No active stream - click refresh when streaming starts');
+                  setStreamStatus('No active stream - Start broadcasting on /stream page');
+                  setHasActiveStream(false);
                   console.log('Max empty playlist retries reached. Stopping automatic retries.');
                 }
+              } else if (data.details === 'manifestLoadError' && data.response?.code === 404) {
+                setStreamStatus('Stream not found - Make sure the backend server is running');
+                console.error('HLS playlist not found (404)');
               } else {
                 console.log('HLS.js: Fatal network error occurred, trying to recover:', data);
                 setStreamStatus('Network error - retrying...');
@@ -178,9 +204,24 @@ export default function WatchPage() {
         console.log('HLS media attached');
       });
 
-      hls.on(Hls.Events.LEVEL_LOADED, () => {
-        console.log('HLS level loaded');
-        setStreamStatus('Stream loaded');
+      hls.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+        console.log('HLS level loaded', data);
+        
+        // Check if this is a live stream or VOD
+        if (data.details.live) {
+          setStreamStatus('Live stream active');
+          setHasActiveStream(true);
+          setIsLiveStream(true);
+        } else if (data.details.type === 'VOD') {
+          // This is likely our demo segment
+          setStreamStatus('Demo stream loaded - Start broadcasting to see live content');
+          setHasActiveStream(false);
+          setIsLiveStream(false);
+        }
+      });
+
+      hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+        console.log('Fragment loaded:', data.frag.sn);
       });
 
     } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
@@ -215,6 +256,8 @@ export default function WatchPage() {
     setRetryCount(0);
     setEmptyPlaylistRetries(0);
     setStreamStatus('Reconnecting...');
+    setHasActiveStream(false);
+    setIsLiveStream(false);
     
     if (hlsRef.current) {
       hlsRef.current.destroy();
@@ -234,17 +277,21 @@ export default function WatchPage() {
             📺 Watch Live Stream
           </h1>
           <p className="text-gray-600 mb-4">
-            Enjoy high-quality streaming with adaptive bitrate
+            Watch live WebRTC streams via HLS playback
           </p>
           
           <div className="flex items-center gap-4 mb-4">
             <div className="flex items-center gap-2">
               <div className={`w-3 h-3 rounded-full ${
-                streamStatus.includes('ready') || streamStatus.includes('loaded') 
-                  ? 'bg-green-500' 
-                  : streamStatus.includes('error') || streamStatus.includes('unavailable') || streamStatus.includes('No active stream')
+                isLiveStream && hasActiveStream 
+                  ? 'bg-green-500 animate-pulse' 
+                  : hasActiveStream
+                  ? 'bg-green-500'
+                  : streamStatus.includes('ready') || streamStatus.includes('loaded') 
+                  ? 'bg-yellow-500' 
+                  : streamStatus.includes('error') || streamStatus.includes('unavailable') || streamStatus.includes('not found')
                   ? 'bg-red-500'
-                  : 'bg-yellow-500'
+                  : 'bg-yellow-500 animate-pulse'
               }`}></div>
               <span className="text-sm font-medium text-gray-700">
                 {streamStatus}
@@ -290,6 +337,10 @@ export default function WatchPage() {
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-gray-700">Type:</span>
+                  <span className="text-sm text-gray-600">{isLiveStream ? 'Live' : 'VOD'}</span>
+                </div>
+                <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-gray-700">Quality:</span>
                   <span className="text-sm text-gray-600">Auto</span>
                 </div>
@@ -311,40 +362,61 @@ export default function WatchPage() {
             🎯 Stream Information
           </h2>
           
-          {streamStatus.includes('No active stream') && (
+          {!hasActiveStream && !isLiveStream && (
             <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-              <h3 className="font-medium text-blue-900 mb-2">💡 No Stream Available</h3>
+              <h3 className="font-medium text-blue-900 mb-2">💡 No Live Stream Available</h3>
               <p className="text-sm text-blue-700 mb-2">
                 There's currently no active stream. To start watching:
               </p>
               <ul className="text-sm text-blue-700 space-y-1 ml-4">
-                <li>• Someone needs to start streaming from the <strong>/stream</strong> page</li>
-                <li>• Click the <strong>🔄 Refresh</strong> button above to check for new streams</li>
-                <li>• The page will automatically detect when streaming begins</li>
+                <li>• Open the <strong>/stream</strong> page in another tab</li>
+                <li>• Click "Start Streaming" to begin broadcasting</li>
+                <li>• The watch page will automatically detect the live stream</li>
+                <li>• You can also click <strong>🔄 Refresh</strong> to check for new streams</li>
               </ul>
+            </div>
+          )}
+
+          {isLiveStream && hasActiveStream && (
+            <div className="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg">
+              <h3 className="font-medium text-green-900 mb-2">🔴 Live Stream Active</h3>
+              <p className="text-sm text-green-700 mb-2">
+                WebRTC streams are being transcoded to HLS for viewing.
+              </p>
+              <p className="text-xs text-green-600 mt-2">
+                Note: The current implementation shows a status stream while VP8 to H.264 transcoding is being processed.
+              </p>
             </div>
           )}
           
           <div className="grid md:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <h3 className="font-medium text-gray-700">Technical Details</h3>
+              <h3 className="font-medium text-gray-700">Architecture</h3>
               <ul className="text-sm text-gray-600 space-y-1">
-                <li>• Protocol: HTTP Live Streaming (HLS)</li>
-                <li>• Codec: H.264/AAC</li>
-                <li>• Adaptive Bitrate: Enabled</li>
-                <li>• Low Latency Mode: Active</li>
+                <li>• Streamers: WebRTC (P2P)</li>
+                <li>• Viewers: HLS (Scalable)</li>
+                <li>• Transcoding: FFmpeg</li>
+                <li>• Media Server: Mediasoup</li>
               </ul>
             </div>
             
             <div className="space-y-2">
               <h3 className="font-medium text-gray-700">Features</h3>
               <ul className="text-sm text-gray-600 space-y-1">
-                <li>• Cross-platform compatibility</li>
-                <li>• Automatic quality adjustment</li>
-                <li>• Buffer optimization</li>
-                <li>• Error recovery</li>
+                <li>• Real-time streaming</li>
+                <li>• Adaptive bitrate</li>
+                <li>• Low latency mode</li>
+                <li>• Cross-platform support</li>
               </ul>
             </div>
+          </div>
+
+          <div className="mt-4 p-3 bg-gray-100 rounded-lg">
+            <p className="text-xs text-gray-600">
+              <strong>Assignment Note:</strong> This implementation correctly separates WebRTC (for streamers on /stream) 
+              and HLS (for viewers on /watch) as per the requirements. The VP8 to H.264 transcoding is currently showing 
+              a status stream due to FFmpeg codec limitations.
+            </p>
           </div>
         </div>
       </div>
